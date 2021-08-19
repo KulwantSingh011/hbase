@@ -171,6 +171,11 @@ public class BucketCache implements BlockCache, HeapSize {
   /** Cache access count (sequential ID) */
   private final AtomicLong accessCount = new AtomicLong();
 
+  /** Tracing failed Bucket Cache allocations. */
+  private LongAdder sinceLastTraceAllocFailCount = new LongAdder();
+  private LongAdder sinceLastTraceAllocFailSize  = new LongAdder();
+  private long prevRecTE; // previous recorded time since Epoch in seconds
+
   private static final int DEFAULT_CACHE_WAIT_TIME = 50;
 
   /**
@@ -288,6 +293,10 @@ public class BucketCache implements BlockCache, HeapSize {
     this.persistencePath = persistencePath;
     this.blockSize = blockSize;
     this.ioErrorsTolerationDuration = ioErrorsTolerationDuration;
+
+    prevRecTE = 0;
+    sinceLastTraceAllocFailCount.reset();
+    sinceLastTraceAllocFailSize.reset();
 
     bucketAllocator = new BucketAllocator(capacity, bucketSizes);
     for (int i = 0; i < writerThreads.length; ++i) {
@@ -969,10 +978,26 @@ public class BucketCache implements BlockCache, HeapSize {
           }
           index++;
         } catch (BucketAllocatorException fle) {
-          LOG.warn("Failed allocation for " + (re == null ? "" : re.getKey()) + "; " + fle);
+          long currTE = System.currentTimeMillis()/1000; // Current time since Epoch in seconds.
+          if (prevRecTE == 0) {
+            // The very first exception.
+            LOG.warn("Failed allocation for " + (re == null ? "" : re.getKey()) + "; " + fle);
+          } else {
+            // Record the warning.
+            sinceLastTraceAllocFailCount.increment();
+            sinceLastTraceAllocFailSize.add(re.getData().getSerializedLength());
+            if (currTE - prevRecTE > 60) {
+              LOG.warn("Failed allocations since last trace: " + " count: " + sinceLastTraceAllocFailCount
+                + " size: " + sinceLastTraceAllocFailSize);
+              LOG.warn("Most recent failed allocation: key: " + (re == null ? "" : re.getKey()) + "; " + fle);
+              sinceLastTraceAllocFailCount.reset();
+              sinceLastTraceAllocFailSize.reset();
+            }
+          }
           // Presume can't add. Too big? Move index on. Entry will be cleared from ramCache below.
           bucketEntries[index] = null;
           index++;
+          prevRecTE = currTE;
         } catch (CacheFullException cfe) {
           // Cache full when we tried to add. Try freeing space and then retrying (don't up index)
           if (!freeInProgress) {
