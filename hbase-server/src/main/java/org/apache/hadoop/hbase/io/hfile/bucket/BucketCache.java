@@ -247,6 +247,10 @@ public class BucketCache implements BlockCache, HeapSize {
    * */
   private String algorithm;
 
+  /* Tracing failed Bucket Cache allocations. */
+  private long prevRecTE; // previous recorded time since Epoch in seconds
+  private static final int ALLOCATION_FAIL_TRACE_TIME_GAP = 60; // Default 60 seconds.
+
   public BucketCache(String ioEngineName, long capacity, int blockSize, int[] bucketSizes,
       int writerThreadNum, int writerQLen, String persistencePath) throws IOException {
     this(ioEngineName, capacity, blockSize, bucketSizes, writerThreadNum, writerQLen,
@@ -288,6 +292,8 @@ public class BucketCache implements BlockCache, HeapSize {
     this.persistencePath = persistencePath;
     this.blockSize = blockSize;
     this.ioErrorsTolerationDuration = ioErrorsTolerationDuration;
+
+    this.prevRecTE = 0;
 
     bucketAllocator = new BucketAllocator(capacity, bucketSizes);
     for (int i = 0; i < writerThreads.length; ++i) {
@@ -662,7 +668,9 @@ public class BucketCache implements BlockCache, HeapSize {
           (StringUtils.formatPercent(cacheStats.getHitCachingRatio(), 2)+ ", ")) +
         "evictions=" + cacheStats.getEvictionCount() + ", " +
         "evicted=" + cacheStats.getEvictedCount() + ", " +
-        "evictedPerRun=" + cacheStats.evictedPerEviction());
+        "evictedPerRun=" + cacheStats.evictedPerEviction() + ", " +
+        "allocationFailCount=" + cacheStats.getAllocationFailCount() + ", " +
+        "allocationFailSize=" + cacheStats.getAllocationFailSize());
     cacheStats.reset();
   }
 
@@ -969,10 +977,25 @@ public class BucketCache implements BlockCache, HeapSize {
           }
           index++;
         } catch (BucketAllocatorException fle) {
-          LOG.warn("Failed allocation for " + (re == null ? "" : re.getKey()) + "; " + fle);
+          long currTE = System.currentTimeMillis()/1000; // Current time since Epoch in seconds.
+          // Record the warning.
+          cacheStats.allocationFailed(re.getData().getSerializedLength());
+          if (prevRecTE == 0) {
+            // The very first exception.
+            LOG.warn("Failed allocation for " + (re == null ? "" : re.getKey()) + "; " + fle +
+              " HFile: " + (re == null ? "" : re.getKey().getHfileName()));
+          } else {
+            if (currTE - prevRecTE > ALLOCATION_FAIL_TRACE_TIME_GAP) {
+              LOG.warn("Most recent failed allocation in " + ALLOCATION_FAIL_TRACE_TIME_GAP +
+                "seconds: key: " + (re == null ? "" : re.getKey()) + "; " + fle +
+                " HFile: " + (re == null ? "" : re.getKey().getHfileName()));
+            }
+            // else do nothing, the exception has already been recorded above.
+          }
           // Presume can't add. Too big? Move index on. Entry will be cleared from ramCache below.
           bucketEntries[index] = null;
           index++;
+          prevRecTE = currTE;
         } catch (CacheFullException cfe) {
           // Cache full when we tried to add. Try freeing space and then retrying (don't up index)
           if (!freeInProgress) {
