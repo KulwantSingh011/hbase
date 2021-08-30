@@ -41,6 +41,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -60,7 +61,6 @@ import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.MultiActionResultTooLarge;
 import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.PrivateCellUtil;
@@ -319,6 +319,10 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
    * Default value of config {@link RSRpcServices#REJECT_BATCH_ROWS_OVER_THRESHOLD}
    */
   private static final boolean DEFAULT_REJECT_BATCH_ROWS_OVER_THRESHOLD = false;
+
+  public static final String CLIENT_BOOTSTRAP_NODE_LIMIT = "hbase.client.bootstrap.node.limit";
+
+  public static final int DEFAULT_CLIENT_BOOTSTRAP_NODE_LIMIT = 10;
 
   // Request counter. (Includes requests that are not serviced by regions.)
   // Count only once for requests with multiple actions like multi/caching-scan/replayBatch
@@ -1326,7 +1330,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
   }
 
   protected PriorityFunction createPriority() {
-    return new AnnotationReadingPriorityFunction(this);
+    return new RSAnnotationReadingPriorityFunction(this);
   }
 
   protected void requirePermission(String request, Permission.Action perm) throws IOException {
@@ -4114,18 +4118,20 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
   public GetMetaRegionLocationsResponse getMetaRegionLocations(RpcController controller,
     GetMetaRegionLocationsRequest request) throws ServiceException {
     GetMetaRegionLocationsResponse.Builder builder = GetMetaRegionLocationsResponse.newBuilder();
-    Optional<List<HRegionLocation>> metaLocations =
-      regionServer.getMetaRegionLocationCache().getMetaRegionLocations();
-    metaLocations.ifPresent(hRegionLocations -> hRegionLocations
-      .forEach(location -> builder.addMetaLocations(ProtobufUtil.toRegionLocation(location))));
+    regionServer.getMetaLocations()
+      .forEach(location -> builder.addMetaLocations(ProtobufUtil.toRegionLocation(location)));
     return builder.build();
   }
 
   @Override
   public final GetBootstrapNodesResponse getBootstrapNodes(RpcController controller,
     GetBootstrapNodesRequest request) throws ServiceException {
+    List<ServerName> bootstrapNodes = new ArrayList<>(regionServer.getRegionServers());
+    Collections.shuffle(bootstrapNodes, ThreadLocalRandom.current());
+    int maxNodeCount = regionServer.getConfiguration().getInt(CLIENT_BOOTSTRAP_NODE_LIMIT,
+      DEFAULT_CLIENT_BOOTSTRAP_NODE_LIMIT);
     GetBootstrapNodesResponse.Builder builder = GetBootstrapNodesResponse.newBuilder();
-    regionServer.getRegionServers().stream().map(ProtobufUtil::toServerName)
+    bootstrapNodes.stream().limit(maxNodeCount).map(ProtobufUtil::toServerName)
       .forEach(builder::addServerName);
     return builder.build();
   }

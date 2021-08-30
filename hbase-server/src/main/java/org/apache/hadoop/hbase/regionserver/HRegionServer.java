@@ -23,6 +23,7 @@ import static org.apache.hadoop.hbase.HConstants.HBASE_SPLIT_WAL_COORDINATED_BY_
 import static org.apache.hadoop.hbase.HConstants.HBASE_SPLIT_WAL_MAX_SPLITTER;
 import static org.apache.hadoop.hbase.util.DNS.UNSAFE_RS_HOSTNAME_KEY;
 
+import com.google.errorprone.annotations.RestrictedApi;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.management.MemoryType;
@@ -75,6 +76,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HDFSBlocksDistribution;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HealthCheckChore;
 import org.apache.hadoop.hbase.MetaRegionLocationCache;
 import org.apache.hadoop.hbase.MetaTableAccessor;
@@ -91,6 +93,7 @@ import org.apache.hadoop.hbase.client.AsyncClusterConnection;
 import org.apache.hadoop.hbase.client.ClusterConnectionFactory;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
+import org.apache.hadoop.hbase.client.ConnectionRegistryEndpoint;
 import org.apache.hadoop.hbase.client.ConnectionUtils;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
@@ -185,7 +188,6 @@ import org.apache.hadoop.hbase.zookeeper.ZKClusterId;
 import org.apache.hadoop.hbase.zookeeper.ZKNodeTracker;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZKWatcher;
-import org.apache.hadoop.hbase.zookeeper.ZNodePaths;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -247,8 +249,9 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProto
  */
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.TOOLS)
 @SuppressWarnings({ "deprecation"})
-public class HRegionServer extends Thread implements
-    RegionServerServices, LastSequenceId, ConfigurationObserver {
+public class HRegionServer extends Thread implements RegionServerServices, LastSequenceId,
+  ConnectionRegistryEndpoint, ConfigurationObserver {
+
   private static final Logger LOG = LoggerFactory.getLogger(HRegionServer.class);
 
   /**
@@ -682,7 +685,12 @@ public class HRegionServer extends Thread implements
       }
       this.rpcServices.start(zooKeeper);
       this.metaRegionLocationCache = new MetaRegionLocationCache(zooKeeper);
-      this.regionServerAddressTracker = new RegionServerAddressTracker(zooKeeper, this);
+      if (!(this instanceof HMaster)) {
+        // do not create this field for HMaster, we have another region server tracker for HMaster.
+        this.regionServerAddressTracker = new RegionServerAddressTracker(zooKeeper, this);
+      } else {
+        this.regionServerAddressTracker = null;
+      }
       // This violates 'no starting stuff in Constructor' but Master depends on the below chore
       // and executor being created and takes a different startup route. Lots of overlap between HRS
       // and M (An M IS A HRS now). Need to refactor so less duplication between M and its super
@@ -863,26 +871,6 @@ public class HRegionServer extends Thread implements
     return true;
   }
 
-  private Configuration cleanupConfiguration() {
-    Configuration conf = this.conf;
-    // We use ZKConnectionRegistry for all the internal communication, primarily for these reasons:
-    // - Decouples RS and master life cycles. RegionServers can continue be up independent of
-    //   masters' availability.
-    // - Configuration management for region servers (cluster internal) is much simpler when adding
-    //   new masters or removing existing masters, since only clients' config needs to be updated.
-    // - We need to retain ZKConnectionRegistry for replication use anyway, so we just extend it for
-    //   other internal connections too.
-    conf.set(HConstants.CLIENT_CONNECTION_REGISTRY_IMPL_CONF_KEY,
-        HConstants.ZK_CONNECTION_REGISTRY_CLASS);
-    if (conf.get(HConstants.CLIENT_ZOOKEEPER_QUORUM) != null) {
-      // Use server ZK cluster for server-issued connections, so we clone
-      // the conf and unset the client ZK related properties
-      conf = new Configuration(this.conf);
-      conf.unset(HConstants.CLIENT_ZOOKEEPER_QUORUM);
-    }
-    return conf;
-  }
-
   /**
    * Run test on configured codecs to make sure supporting libs are in place.
    */
@@ -907,11 +895,11 @@ public class HRegionServer extends Thread implements
    */
   protected final synchronized void setupClusterConnection() throws IOException {
     if (asyncClusterConnection == null) {
-      Configuration conf = cleanupConfiguration();
-      InetSocketAddress localAddress = new InetSocketAddress(this.rpcServices.isa.getAddress(), 0);
+      InetSocketAddress localAddress =
+        new InetSocketAddress(rpcServices.getSocketAddress().getAddress(), 0);
       User user = userProvider.getCurrent();
       asyncClusterConnection =
-        ClusterConnectionFactory.createAsyncClusterConnection(conf, localAddress, user);
+        ClusterConnectionFactory.createAsyncClusterConnection(this, conf, localAddress, user);
     }
   }
 
@@ -2652,13 +2640,6 @@ public class HRegionServer extends Thread implements
     return abortRequested.compareAndSet(false, true);
   }
 
-  /**
-   * @see HRegionServer#abort(String, Throwable)
-   */
-  public void abort(String reason) {
-    abort(reason, null);
-  }
-
   @Override
   public boolean isAborted() {
     return abortRequested.get();
@@ -3631,7 +3612,7 @@ public class HRegionServer extends Thread implements
   }
 
   private String getMyEphemeralNodePath() {
-    return ZNodePaths.joinZNode(this.zooKeeper.getZNodePaths().rsZNode, getServerName().toString());
+    return zooKeeper.getZNodePaths().getRsPath(serverName);
   }
 
   private boolean isHealthCheckerConfigured() {
@@ -4007,19 +3988,29 @@ public class HRegionServer extends Thread implements
     return this.retryPauseTime;
   }
 
+  @Override
   public Optional<ServerName> getActiveMaster() {
     return Optional.ofNullable(masterAddressTracker.getMasterAddress());
   }
 
+  @Override
   public List<ServerName> getBackupMasters() {
     return masterAddressTracker.getBackupMasters();
   }
 
-  public List<ServerName> getRegionServers() {
+  @Override
+  public Collection<ServerName> getRegionServers() {
     return regionServerAddressTracker.getRegionServers();
   }
 
+  @Override
+  public List<HRegionLocation> getMetaLocations() {
+    return metaRegionLocationCache.getMetaRegionLocations();
+  }
+
+  @RestrictedApi(explanation = "Should only be called in tests", link = "",
+    allowedOnPath = ".*/src/test/.*")
   public MetaRegionLocationCache getMetaRegionLocationCache() {
-    return this.metaRegionLocationCache;
+    return metaRegionLocationCache;
   }
 }

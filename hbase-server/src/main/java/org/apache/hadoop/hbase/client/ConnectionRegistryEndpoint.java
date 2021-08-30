@@ -1,4 +1,4 @@
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,28 +17,41 @@
  */
 package org.apache.hadoop.hbase.client;
 
-import static org.apache.hadoop.hbase.HConstants.CLIENT_CONNECTION_REGISTRY_IMPL_CONF_KEY;
-
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.util.ReflectionUtils;
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+import org.apache.hadoop.hbase.HRegionLocation;
+import org.apache.hadoop.hbase.ServerName;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
- * Factory class to get the instance of configured connection registry.
+ * Define the necessary method for carrying {@code ClientMetaService}.
  */
 @InterfaceAudience.Private
-final class ConnectionRegistryFactory {
-
-  private ConnectionRegistryFactory() {
-  }
+public interface ConnectionRegistryEndpoint {
 
   /**
-   * @return The connection registry implementation to use.
+   * Get cluster id.
    */
-  static ConnectionRegistry getRegistry(Configuration conf) {
-    Class<? extends ConnectionRegistry> clazz =
-      conf.getClass(CLIENT_CONNECTION_REGISTRY_IMPL_CONF_KEY, RpcConnectionRegistry.class,
-        ConnectionRegistry.class);
-    return ReflectionUtils.newInstance(clazz, conf);
-  }
+  String getClusterId();
+
+  /**
+   * Get active master address.
+   */
+  Optional<ServerName> getActiveMaster();
+
+  /**
+   * Get backup masters address.
+   */
+  List<ServerName> getBackupMasters();
+
+  /**
+   * Get all the region servers address.
+   */
+  Collection<ServerName> getRegionServers();
+
+  /**
+   * Get the location of meta regions.
+   */
+  List<HRegionLocation> getMetaLocations();
 }
